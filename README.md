@@ -3,6 +3,7 @@
 A Python script for Windows that can play sounds in MS Teams through a virtual audio cable.
 
 Required software:
+- Python
 - Chrome
 - Chrome Driver
 - VLC Media Player
