@@ -7,6 +7,7 @@ import sounddevice
 import soundfile
 import speech_recognition
 import threading
+import time
 from dotenv import load_dotenv
 from pynput import keyboard
 from selenium import webdriver
@@ -107,6 +108,33 @@ def speak(text_to_speak):
 
 
 def listen():
+    def record_audio(q):
+        recognizer = speech_recognition.Recognizer()
+
+        with speech_recognition.Microphone() as source:
+            while listening:
+                print("Recording...")
+                audio = recognizer.record(source, duration=10)
+                q.put(audio)
+
+    def recognize_speech(q):
+        recognizer = speech_recognition.Recognizer()
+
+        while listening:
+            audio = q.get()
+            if audio is None:
+                break
+
+            try:
+                recognized_speech = recognizer.recognize_google(audio)
+                print(f"Recognized speech: {recognized_speech}")
+                with open("recognized_speech.txt", "a") as file:
+                    file.write(recognized_speech + "\n")
+            except speech_recognition.UnknownValueError:
+                print("Could not understand the audio")
+            except speech_recognition.RequestError as e:
+                print("Could not request results; {0}".format(e))
+
     # Switch to virtual cable speaker
     set_audio_device(VIRTUAL_SPEAKER_NAME)
 
@@ -124,27 +152,28 @@ def listen():
     keyboard_listener = keyboard.Listener(on_press=on_press)
     keyboard_listener.start()
 
-    recognizer = speech_recognition.Recognizer()
+    # Clear the output file at the start
+    with open("recognized_speech.txt", "w") as file:
+        pass
 
-    with speech_recognition.Microphone() as source:
-        print("Listening...")
-        audio = None
-        while listening:
-            chunk = recognizer.record(source, duration=1)
-            if audio is None:
-                audio = chunk
-            else:
-                audio = speech_recognition.AudioData(
-                    audio.frame_data + chunk.frame_data, audio.sample_rate, audio.sample_width)
+    # Create a queue to hold audio chunks
+    q = queue.Queue()
 
-        try:
-            recognized_speech = recognizer.recognize_google(audio)
-            with open("recognized_speech.txt", "w") as file:
-                file.write(recognized_speech)
-        except speech_recognition.UnknownValueError:
-            print("Could not understand the audio")
-        except speech_recognition.RequestError as e:
-            print("Could not request results; {0}".format(e))
+    # Create and start the recording thread
+    recording_thread = threading.Thread(target=record_audio, args=(q,))
+    recording_thread.start()
+
+    # Create and start the recognition thread
+    recognition_thread = threading.Thread(target=recognize_speech, args=(q,))
+    recognition_thread.start()
+
+    while listening:
+        time.sleep(1)
+
+    # Stop the threads
+    q.put(None)
+    recording_thread.join()
+    recognition_thread.join()
 
     keyboard_listener.stop()
 
