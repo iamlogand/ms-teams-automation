@@ -114,26 +114,46 @@ def listen():
         with speech_recognition.Microphone() as source:
             while listening:
                 print("Recording...")
-                audio = recognizer.record(source, duration=10)
+                # Record in 1-second chunks
+                audio = recognizer.record(source, duration=1)
                 q.put(audio)
+
+    def recognize_chunk(recognizer, audio):
+        try:
+            start_time = time.time()
+            recognized_speech = recognizer.recognize_google(audio)
+            end_time = time.time()
+            elapsed_time = round(end_time - start_time)
+            duration = round(len(audio.frame_data) / audio.sample_rate)
+            print(f"Recognized {duration}s of speech in {elapsed_time}s: {recognized_speech}")
+            with open("recognized_speech.txt", "a") as file:
+                file.write(recognized_speech + "\n")
+        except speech_recognition.UnknownValueError:
+            print("Could not understand the audio")
+        except speech_recognition.RequestError as e:
+            print("Could not request results; {0}".format(e))
 
     def recognize_speech(q):
         recognizer = speech_recognition.Recognizer()
+        audio = None
 
         while listening:
-            audio = q.get()
-            if audio is None:
+            chunk = q.get()
+            if chunk is None:
                 break
 
-            try:
-                recognized_speech = recognizer.recognize_google(audio)
-                print(f"Recognized speech: {recognized_speech}")
-                with open("recognized_speech.txt", "a") as file:
-                    file.write(recognized_speech + "\n")
-            except speech_recognition.UnknownValueError:
-                print("Could not understand the audio")
-            except speech_recognition.RequestError as e:
-                print("Could not request results; {0}".format(e))
+            if audio is None:
+                audio = chunk
+            else:
+                audio = speech_recognition.AudioData(
+                    audio.frame_data + chunk.frame_data, audio.sample_rate, audio.sample_width)
+
+            if len(audio.frame_data) >= audio.sample_rate * 10:
+                recognize_chunk(recognizer, audio)
+                audio = None
+
+        if audio is not None:
+            recognize_chunk(recognizer, audio)
 
     # Switch to virtual cable speaker
     set_audio_device(VIRTUAL_SPEAKER_NAME)
@@ -144,17 +164,13 @@ def listen():
         nonlocal listening
         try:
             if key == keyboard.Key.backspace:
-                print("Stopping listening...")
+                print("Stopping recording...")
                 listening = False
         except AttributeError:
             pass
 
     keyboard_listener = keyboard.Listener(on_press=on_press)
     keyboard_listener.start()
-
-    # Clear the output file at the start
-    with open("recognized_speech.txt", "w") as file:
-        pass
 
     # Create a queue to hold audio chunks
     q = queue.Queue()
