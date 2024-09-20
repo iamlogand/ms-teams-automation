@@ -1,3 +1,4 @@
 env
 .env
 audio_cache/
+recognized_speech.txt

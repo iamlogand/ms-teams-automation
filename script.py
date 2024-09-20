@@ -138,9 +138,9 @@ def listen():
                     audio.frame_data + chunk.frame_data, audio.sample_rate, audio.sample_width)
 
         try:
-            print(
-                "Recognized Speech: " + recognizer.recognize_google(audio)
-            )
+            recognized_speech = recognizer.recognize_google(audio)
+            with open("recognized_speech.txt", "w") as file:
+                file.write(recognized_speech)
         except speech_recognition.UnknownValueError:
             print("Could not understand the audio")
         except speech_recognition.RequestError as e:
