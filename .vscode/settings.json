@@ -1,11 +1,15 @@
 {
     "cSpell.words": [
+        "astype",
         "chromedriver",
         "dotenv",
-        "padx",
-        "pady",
+        "dtype",
+        "frombuffer",
+        "indata",
+        "pynput",
         "samplerate",
         "sounddevice",
-        "soundfile"
+        "soundfile",
+        "tobytes"
     ]
 }

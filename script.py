@@ -1,19 +1,26 @@
+import numpy
 import os
+import queue
 import re
 import requests
 import sounddevice
 import soundfile
+import speech_recognition
+import threading
 from dotenv import load_dotenv
+from pynput import keyboard
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 # Load environment variables
 load_dotenv()
 
-# constants
+# Constants
 CHROME_DRIVER_PATH = "C:\\Program Files\\chromedriver-win64\\chromedriver.exe"
-VIRTUAL_CABLE_NAME = "CABLE Output"
 MICROPHONE_NAME = "Microphone Array"
+VIRTUAL_MICROPHONE_NAME = "CABLE Output"
+SPEAKER_NAME = "Headset"
+VIRTUAL_SPEAKER_NAME = "CABLE Input"
 CHUNK_SIZE = 1024
 API_KEY = os.getenv("API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
@@ -28,7 +35,7 @@ def click_button(xpath):
     return True
 
 
-def set_audio_input_device(audio_device_name):
+def set_audio_device(audio_device_name):
     device_locator = f"//*[contains(text(), '{audio_device_name}')]"
     setting_locator = f"//*[contains(text(), 'Audio settings')]"
     more_locator = "//button[@id='callingButtons-showMoreBtn']"
@@ -84,8 +91,8 @@ def play_audio(file_path):
 
 
 def speak(text_to_speak):
-    # Switch to virtual cable output as input
-    set_audio_input_device(VIRTUAL_CABLE_NAME)
+    # Switch to virtual cable microphone
+    set_audio_device(VIRTUAL_MICROPHONE_NAME)
 
     # Fetch audio if not already cached
     file_path = get_audio_file_path(text_to_speak)
@@ -95,8 +102,54 @@ def speak(text_to_speak):
     # Play audio
     play_audio(file_path)
 
-    # Switch to microphone input
-    set_audio_input_device(MICROPHONE_NAME)
+    # Switch to microphone
+    set_audio_device(MICROPHONE_NAME)
+
+
+def listen():
+    # Switch to virtual cable speaker
+    set_audio_device(VIRTUAL_SPEAKER_NAME)
+
+    listening = True
+
+    def on_press(key):
+        nonlocal listening
+        try:
+            if key == keyboard.Key.backspace:
+                print("Stopping listening...")
+                listening = False
+        except AttributeError:
+            pass
+
+    keyboard_listener = keyboard.Listener(on_press=on_press)
+    keyboard_listener.start()
+
+    recognizer = speech_recognition.Recognizer()
+
+    with speech_recognition.Microphone() as source:
+        print("Listening...")
+        audio = None
+        while listening:
+            chunk = recognizer.record(source, duration=1)
+            if audio is None:
+                audio = chunk
+            else:
+                audio = speech_recognition.AudioData(
+                    audio.frame_data + chunk.frame_data, audio.sample_rate, audio.sample_width)
+
+        try:
+            print(
+                "Recognized Speech: " + recognizer.recognize_google(audio)
+            )
+        except speech_recognition.UnknownValueError:
+            print("Could not understand the audio")
+        except speech_recognition.RequestError as e:
+            print("Could not request results; {0}".format(e))
+
+    keyboard_listener.stop()
+
+    # Switch to virtual cable speaker
+    set_audio_device(SPEAKER_NAME)
 
 
 # Connect to browser
@@ -107,4 +160,7 @@ chrome_driver = webdriver.Chrome(options=chrome_options)
 # Main loop
 while True:
     input_text = input(">>> ")
-    speak(input_text)
+    if input_text == r"l":
+        listen()
+    else:
+        speak(input_text)

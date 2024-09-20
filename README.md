@@ -12,7 +12,7 @@ Required software:
 Setup:
 1. Create Python virtual environment and install packages from requirements.txt
 1. Customize constants if needed in script.py
-1. Set Windows default Playback device to CABLE Input
+1. Set Windows default Playback device to CABLE Input and Recording device to CABLE Output
 1. Start Chrome with a custom debugging port using a command like this:
    ```
    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\Users\loganm\chrome_dev_data_directory"
