@@ -27,8 +27,8 @@ EL_API_KEY = os.getenv("EL_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LOGS_PATH = ".\\logs.txt"
-LATEST_TRANSCRIPT_PATH = ".\\transcript\\latest_transcript.txt"
-HIGH_QUALITY_TRANSCRIPT_PATH = ".\\transcript\\high_quality_transcript.txt"
+LATEST_TRANSCRIPT_PATH = ".\\transcripts\\latest_transcript.txt"
+HIGH_QUALITY_TRANSCRIPT_PATH = ".\\transcripts\\high_quality_transcript.txt"
 
 
 def click_button(xpath):
