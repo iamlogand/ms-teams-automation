@@ -6,10 +6,12 @@
         "dtype",
         "frombuffer",
         "indata",
+        "openai",
         "pynput",
         "samplerate",
         "sounddevice",
         "soundfile",
-        "tobytes"
+        "tobytes",
+        "UNLCK"
     ]
 }
