@@ -108,93 +108,84 @@ def speak(text_to_speak):
 
 
 def listen():
-    def record_audio(q):
+    def record_audio(audio_queue):
         recognizer = speech_recognition.Recognizer()
-
         with speech_recognition.Microphone() as source:
-            while listening:
-                print("Recording...")
-                # Record in 1-second chunks
-                audio = recognizer.record(source, duration=1)
-                q.put(audio)
+            index = 0
+            while True:
+                message_queue.put(f"== Recording chunk {index}")
+                audio = recognizer.record(source, duration=2)
+                audio_queue.put({"index": index, "audio": audio})
+                index += 1
 
-    def recognize_chunk(recognizer, audio):
-        try:
-            start_time = time.time()
-            recognized_speech = recognizer.recognize_google(audio)
-            end_time = time.time()
-            elapsed_time = round(end_time - start_time)
-            duration = round(len(audio.frame_data) / audio.sample_rate)
-            print(f"Recognized {duration}s of speech in {elapsed_time}s: {recognized_speech}")
+    def recognize_speech(audio_queue):
+        recognizer = speech_recognition.Recognizer()
+        buffer = []
+
+        while True:
+            if len(buffer) < 2:  # fill the buffer
+                data = audio_queue.get()
+                if data is None:
+                    break
+                buffer.append(data)
+            else:  # slide the window forward
+                buffer.pop(0)
+                data = audio_queue.get()
+                if data is None:
+                    break
+                buffer.append(data)
+
+            # Combine the chunks in the buffer into one audio sample
+            audio_sample = speech_recognition.AudioData(
+                b''.join(chunk['audio'].frame_data for chunk in buffer), data['audio'].sample_rate, data['audio'].sample_width)
+
+            # Print the range of chunks being recognized
+            first_chunk_index = buffer[0]['index']
+            last_chunk_index = buffer[-1]['index']
+            message_prefix = f"Recognize chunks {
+                first_chunk_index}-{last_chunk_index}:"
+
+            try:
+                recognized_speech = recognizer.recognize_google(audio_sample)
+            except speech_recognition.UnknownValueError:
+                message_queue.put(f"==== {message_prefix} [not understood]")
+                continue
+            except speech_recognition.RequestError as e:
+                message_queue.put(f"==== {message_prefix} [error]")
+                continue
+
+            message_queue.put(f"==== {message_prefix} {recognized_speech}")
             with open("recognized_speech.txt", "a") as file:
                 file.write(recognized_speech + "\n")
-        except speech_recognition.UnknownValueError:
-            print("Could not understand the audio")
-        except speech_recognition.RequestError as e:
-            print("Could not request results; {0}".format(e))
 
-    def recognize_speech(q):
-        recognizer = speech_recognition.Recognizer()
-        audio = None
-
-        while listening:
-            chunk = q.get()
-            if chunk is None:
+    def console_writer(message_queue):
+        while True:
+            message = message_queue.get()
+            if message is None:
                 break
-
-            if audio is None:
-                audio = chunk
-            else:
-                audio = speech_recognition.AudioData(
-                    audio.frame_data + chunk.frame_data, audio.sample_rate, audio.sample_width)
-
-            if len(audio.frame_data) >= audio.sample_rate * 10:
-                recognize_chunk(recognizer, audio)
-                audio = None
-
-        if audio is not None:
-            recognize_chunk(recognizer, audio)
-
-    # Switch to virtual cable speaker
-    set_audio_device(VIRTUAL_SPEAKER_NAME)
-
-    listening = True
-
-    def on_press(key):
-        nonlocal listening
-        try:
-            if key == keyboard.Key.backspace:
-                print("Stopping recording...")
-                listening = False
-        except AttributeError:
-            pass
-
-    keyboard_listener = keyboard.Listener(on_press=on_press)
-    keyboard_listener.start()
+            print(message)
 
     # Create a queue to hold audio chunks
-    q = queue.Queue()
+    audio_queue = queue.Queue()
+    message_queue = queue.Queue()
 
-    # Create and start the recording thread
-    recording_thread = threading.Thread(target=record_audio, args=(q,))
+    # Create and start the recording and console writing threads
+    recording_thread = threading.Thread(
+        target=record_audio, args=(audio_queue,))
     recording_thread.start()
 
-    # Create and start the recognition thread
-    recognition_thread = threading.Thread(target=recognize_speech, args=(q,))
+    console_writer_thread = threading.Thread(
+        target=console_writer, args=(message_queue,))
+    console_writer_thread.start()
+
+    # Create and start a single recognition thread
+    recognition_thread = threading.Thread(
+        target=recognize_speech, args=(audio_queue,))
     recognition_thread.start()
 
-    while listening:
+    # Wait infinitely
+    while True:
         time.sleep(1)
-
-    # Stop the threads
-    q.put(None)
-    recording_thread.join()
-    recognition_thread.join()
-
-    keyboard_listener.stop()
-
-    # Switch to virtual cable speaker
-    set_audio_device(SPEAKER_NAME)
 
 
 # Connect to browser
@@ -202,10 +193,4 @@ chrome_options = webdriver.ChromeOptions()
 chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
 chrome_driver = webdriver.Chrome(options=chrome_options)
 
-# Main loop
-while True:
-    input_text = input(">>> ")
-    if input_text == r"l":
-        listen()
-    else:
-        speak(input_text)
+listen()
