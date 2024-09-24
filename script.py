@@ -1,3 +1,5 @@
+import collections
+import io
 import msvcrt
 import os
 import queue
@@ -8,10 +10,12 @@ import soundfile
 import speech_recognition
 import threading
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -20,15 +24,30 @@ load_dotenv()
 CHROME_DRIVER_PATH = "C:\\Program Files\\chromedriver-win64\\chromedriver.exe"
 MICROPHONE_NAME = "Microphone Array"
 VIRTUAL_MICROPHONE_NAME = "CABLE Output"
-SPEAKER_NAME = "Headset"
 VIRTUAL_SPEAKER_NAME = "CABLE Input"
+VIRTUAL_SPEAKER_INDEX = 12  # Find via `print(sounddevice.query_devices())`
 CHUNK_SIZE = 1024
 EL_API_KEY = os.getenv("EL_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LOGS_PATH = ".\\logs.txt"
-LATEST_TRANSCRIPT_PATH = ".\\transcripts\\latest_transcript.txt"
-HIGH_QUALITY_TRANSCRIPT_PATH = ".\\transcripts\\high_quality_transcript.txt"
+USERNAME = "Logan"
+CONTEXT = """Logan is a software engineer that works at a company called AutoRek.
+This conversation is an ongoing Microsoft Teams work call."""
+
+
+class AudioChunk:
+    def __init__(self, id, audio, timestamp):
+        self.id = id
+        self.audio = audio
+        self.timestamp = timestamp
+
+
+class TranscriptionChunk:
+    def __init__(self, text, timestamp, type):
+        self.text = text
+        self.timestamp = timestamp
+        self.type = type
 
 
 def click_button(xpath):
@@ -40,7 +59,10 @@ def click_button(xpath):
     return True
 
 
-def set_audio_device(audio_device_name):
+def set_audio_device(chrome_driver, audio_device_name):
+    if chrome_driver is None:
+        return
+
     device_locator = f"//*[contains(text(), '{audio_device_name}')]"
     setting_locator = f"//*[contains(text(), 'Audio settings')]"
     more_locator = "//button[@id='callingButtons-showMoreBtn']"
@@ -58,13 +80,7 @@ def set_audio_device(audio_device_name):
     button.click()
 
 
-def get_audio_file_path(text_to_speak):
-    file_name = re.sub(r'[?]', '_', text_to_speak)
-    file_name = re.sub(r'[<>:"/\\|*]', '', file_name)
-    return f".\\audio_cache\\{file_name}.mp3"
-
-
-def fetch_audio(text_to_speak, output_file_path):
+def fetch_audio(text_to_speak):
     tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
     headers = {
         "Accept": "application/json",
@@ -82,66 +98,68 @@ def fetch_audio(text_to_speak, output_file_path):
     }
     response = requests.post(tts_url, headers=headers, json=data, stream=True)
     if response.ok:
-        with open(output_file_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                f.write(chunk)
+        audio_data = bytearray()
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            audio_data.extend(chunk)
+        return audio_data
     else:
         print(response.text)
+        return None
 
 
-def play_audio(file_path):
-    data, samplerate = soundfile.read(file_path)
-    sounddevice.play(data, samplerate)
-    sounddevice.wait()
-
-
-def speak(text_to_speak):
-    # Switch to virtual cable microphone
-    set_audio_device(VIRTUAL_MICROPHONE_NAME)
-
-    # Fetch audio if not already cached
-    file_path = get_audio_file_path(text_to_speak)
-    if not os.path.isfile(file_path):
-        fetch_audio(text_to_speak, file_path)
+def play_audio(audio_data):
+    # Find output device
+    devices = sounddevice.query_devices()
+    for index, device in enumerate(devices):
+        if device['name'] == VIRTUAL_SPEAKER_NAME:
+            virtual_speaker_index = index
+            break
 
     # Play audio
-    play_audio(file_path)
+    with io.BytesIO(audio_data) as audio_stream:
+        data, samplerate = soundfile.read(audio_stream)
+        sounddevice.play(data, samplerate, device=virtual_speaker_index)
+        sounddevice.wait()
+
+
+def speak(text_to_speak, chrome_driver):
+    # Switch to virtual microphone
+    set_audio_device(chrome_driver, VIRTUAL_MICROPHONE_NAME)
+
+    # Fetch audio
+    print("Speaking:", text_to_speak)
+    audio_data = fetch_audio(text_to_speak)
+
+    if audio_data is not None:
+        play_audio(audio_data)
+        print("Done speaking")
+    else:
+        print("Failed to fetch audio.")
 
     # Switch to microphone
-    set_audio_device(MICROPHONE_NAME)
+    set_audio_device(chrome_driver, MICROPHONE_NAME)
 
 
-def read_file(file_path):
-    with file_lock:
-        with open(file_path, "r") as file:
-            data = file.read()
-    return data
-
-
-def read_and_clear_file(file_path):
-    with file_lock:
-        with open(file_path, "r+") as file:
-            data = file.read()
-            file.seek(0)
-            file.truncate()
-    return data
-
-
-def append_to_file(file_path, line):
-    with file_lock:
-        with open(file_path, "a") as file:
-            file.write(line)
-
-
-def audio_recorder(audio_queue, message_queue):
-    recognizer = speech_recognition.Recognizer()
+def recorder(audio_queue, message_queue):
     with speech_recognition.Microphone() as source:
-        index = 0
+        recognizer = speech_recognition.Recognizer()
+        recognizer.pause_threshold = 0.5
+
+        id = 0
         while True:
-            message_queue.put(f"== Recording chunk {index}")
-            audio = recognizer.record(source, duration=2)
-            audio_queue.put({"index": index, "audio": audio})
-            index += 1
+            try:
+                message_queue.put(f".. Started recording chunk {id}")
+                audio = recognizer.listen(
+                    source, timeout=5, phrase_time_limit=30)
+                message_queue.put(
+                    f".. Finished recording chunk {id}: success")
+                audio_chunk = AudioChunk(id, audio, datetime.now())
+                audio_queue.put(audio_chunk)
+            except speech_recognition.WaitTimeoutError:
+                message_queue.put(
+                    f".. Finished recording chunk {id}: error")
+
+            id += 1
 
 
 def logger(message_queue):
@@ -151,116 +169,97 @@ def logger(message_queue):
             break
         time_now = time.strftime(r"%Y-%m-%d %H:%M:%S", time.localtime())
         with open(LOGS_PATH, "a") as file:
-            file.write(f"{time_now}: {message}\n")
+            file.write(f"{time_now} {message}\n")
 
 
-def speech_recognizer(audio_queue, message_queue):
+def transcriber(audio_queue, transcription_queue, message_queue):
     recognizer = speech_recognition.Recognizer()
-    buffer = []
 
     while True:
-        if len(buffer) < 2:  # fill the buffer
-            data = audio_queue.get()
-            if data is None:
-                break
-            buffer.append(data)
-        else:  # slide the window forward
-            buffer.pop(0)
-            data = audio_queue.get()
-            if data is None:
-                break
-            buffer.append(data)
+        audio_chunk: AudioChunk = audio_queue.get()
+        if audio_chunk is None:
+            time.sleep(0.1)
+            continue
 
-        # Combine the chunks in the buffer into one audio sample
-        audio_sample = speech_recognition.AudioData(
-            b''.join(chunk['audio'].frame_data for chunk in buffer), data['audio'].sample_rate, data['audio'].sample_width)
+        message_queue.put(f".... Started transcribing chunk {audio_chunk.id}")
 
-        # Print the range of chunks being recognized
-        first_chunk_index = buffer[0]['index']
-        last_chunk_index = buffer[-1]['index']
-        message_prefix = f"Recognized chunks {
-            first_chunk_index}-{last_chunk_index}:"
-
+        message_prefix = f"Finished transcribing chunk {audio_chunk.id}:"
+        recognized_speech = ""
         try:
-            recognized_speech = recognizer.recognize_google(audio_sample)
+            recognized_speech = recognizer.recognize_google(audio_chunk.audio)
+            transcription_chunk = TranscriptionChunk(
+                recognized_speech, audio_chunk.timestamp, "others")
+            transcription_queue.put(transcription_chunk)
+            message_queue.put(f'.... {message_prefix} "{recognized_speech}"')
         except speech_recognition.UnknownValueError:
-            message_queue.put(f"==== {message_prefix} [not understood]")
-            continue
+            message_queue.put(f".... {message_prefix} not understood")
         except speech_recognition.RequestError as e:
-            message_queue.put(f"==== {message_prefix} [error]")
-            continue
-
-        message_queue.put(f"==== {message_prefix} {recognized_speech}")
-        append_to_file(
-            LATEST_TRANSCRIPT_PATH, f"chunk {last_chunk_index}: {recognized_speech}\n")
+            message_queue.put(f".... {message_prefix} error")
 
 
-def transcription_manager(client):
-    while True:
-        time.sleep(20)
+def generate_speech(openai_client, annotated_transcript, user_command_text):
 
-        latest_transcript = read_and_clear_file(LATEST_TRANSCRIPT_PATH)
+    # Build messages
+    messages = []
+    if annotated_transcript:
+        formatted_transcript = "\n".join(
+            [f"{chunk.timestamp} {chunk.type}: {chunk.text}" for chunk in annotated_transcript])
+        messages.append({
+            "role": "user",
+            "content": f"""Here's a transcript of the conversation up until:\n{formatted_transcript}"""
+        })
+    messages.append({"role": "user", "content": CONTEXT})
+    messages.append({
+        "role": "user",
+        "content": f"""You must take the role of {USERNAME}, a participant in the conversation.
+Respond with only the words {USERNAME} would say, no more.
+Your response must not include any additional information like timestamps or usernames."""
+    })
+    user_command_text = user_command_text.strip()
+    hint = f" (hint: {user_command_text})" if user_command_text else ""
+    messages.append({
+        "role": "user",
+        "content": f"What does {USERNAME} say next? {hint}"
+    })
 
-        if len(latest_transcript) == 0:
-            continue
-
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "The user will provide you with a transcript made from overlapping chunks of audio. You need to process it into coherent text. Here's an example of what is expected:\n\nBefore we wrap up today's meeting, let's quickly go over the progress we've made on our current sprint and identify any blockers that might delay our delivery timeline.\n\nThis is a coherent sentence extracted from a conversation, and you need to generate similar coherent sentences from the provided transcript."
-                },
-                {
-                    "role": "user",
-                    "content": "Please transform this overlapping transcript into coherent text, focusing on content:\n\n" + latest_transcript
-                }
-            ]
-        )
-        transformed_dialog = completion.choices[0].message.content
-
-        with open(HIGH_QUALITY_TRANSCRIPT_PATH, "a") as file:
-            file.write(f"\n{transformed_dialog}")
-
-
-def process_command(user_command):
-    '''
-    Process the user command and generate a LLM generated response.
-    '''
-
-    if len(user_command) == 0:
-        user_command = "Respond"
-
-    high_quality_transcript = read_file(HIGH_QUALITY_TRANSCRIPT_PATH)
-    latest_transcript = read_file(LATEST_TRANSCRIPT_PATH)
-
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "I'm going to provide you with two transcripts for an ongoing conversation.\n1. The high quality transcript that was spoken earlier.\n2.The latest transcript that was spoken very recently, but has overlapping chunks of dialog and is less coherent."
-            },
-            {
-                "role": "system",
-                "content": "High quality transcript:\n\n" + high_quality_transcript
-            },
-            {
-                "role": "system",
-                "content": "Latest transcript:\n\n" + latest_transcript
-            },
-            {
-                "role": "system",
-                "content": "You must now step into the role of a human that is involved in the conversation. You must must respond as if you were a human in the conversation. You must provide a response that is coherent and relevant to the conversation. The user will secretly provide a command that may or may not help you understand how you should respond. Do not respond to the user as they are only guiding you, respond as if you were participating in the conversation."
-            },
-            {
-                "role": "user",
-                "content": user_command
-            }
-        ]
+    # Generate completion
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-mini", messages=messages
     )
+    return completion.choices[0].message.content
 
-    print(completion.choices[0].message.content)
+
+def process_command(
+    openai_client,
+    chrome_driver,
+    transcription_queue,
+    annotated_transcript: List[TranscriptionChunk]
+):
+    user_command = input(">>> ")
+
+    # Move items from transcription queue to main queue
+    while not transcription_queue.empty():
+        annotated_transcript.append(transcription_queue.get())
+
+    # If command starts with "s/", speak the rest of the command
+    if user_command.startswith("s/"):
+        text_to_speak = user_command[2:]
+        transcription_chunk = TranscriptionChunk(
+            text_to_speak, datetime.now(), "Logan")
+        annotated_transcript.append(transcription_chunk)
+        speak(text_to_speak, chrome_driver)
+        return
+
+    # If command starts with "g/", generate some text based on the command and speak it
+    if user_command.startswith("g/"):
+        user_command_text = user_command[2:]
+        text_to_speak = generate_speech(
+            openai_client, annotated_transcript, user_command_text)
+        transcription_chunk = TranscriptionChunk(
+            text_to_speak, datetime.now(), "Logan")
+        annotated_transcript.append(transcription_chunk)
+        speak(text_to_speak, chrome_driver)
+        return
 
 
 # Connect to browser
@@ -268,44 +267,39 @@ chrome_options = webdriver.ChromeOptions()
 chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
 chrome_driver = webdriver.Chrome(options=chrome_options)
 
-# Create a queue to hold audio chunks
+# Create queues
 audio_queue = queue.Queue()
 message_queue = queue.Queue()
+transcription_queue = queue.Queue()
+
+# Create annotated transcript
+annotated_transcript = []
 
 # Create a file lock
 file_lock = threading.Lock()
 
-# Create empty transcription files
+# Create empty logs file
 with open(LOGS_PATH, "w") as file:
-    pass
-with open(LATEST_TRANSCRIPT_PATH, "w") as file:
-    pass
-with open(HIGH_QUALITY_TRANSCRIPT_PATH, "w") as file:
     pass
 
 # Create OpenAI client
-client = OpenAI()
-client.api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI()
+openai_client.api_key = os.getenv("OPENAI_API_KEY")
 
 # Create and start threads for recording, recognition, logging, and transcription processing
-audio_recorder_thread = threading.Thread(
-    target=audio_recorder, args=(audio_queue, message_queue))
-audio_recorder_thread.start()
-
-speech_recognizer_thread = threading.Thread(
-    target=speech_recognizer, args=(audio_queue, message_queue))
-speech_recognizer_thread.start()
-
-console_writer_thread = threading.Thread(
+logger_thread = threading.Thread(
     target=logger, args=(message_queue,))
-console_writer_thread.start()
+logger_thread.start()
 
-transcription_manager_thread = threading.Thread(
-    target=transcription_manager, args=(client,)
-)
-transcription_manager_thread.start()
+recorder_thread = threading.Thread(
+    target=recorder, args=(audio_queue, message_queue))
+recorder_thread.start()
 
-# Wait infinitely
+transcriber_thread = threading.Thread(
+    target=transcriber, args=(audio_queue, transcription_queue, message_queue))
+transcriber_thread.start()
+
+# Main loop
 while True:
-    user_command = input(">>> ")
-    process_command(user_command)
+    process_command(
+        openai_client, chrome_driver, transcription_queue, annotated_transcript)
