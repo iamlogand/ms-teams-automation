@@ -6,6 +6,8 @@
         "dtype",
         "frombuffer",
         "indata",
+        "messagecontent",
+        "messageheader",
         "openai",
         "pynput",
         "samplerate",

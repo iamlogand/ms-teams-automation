@@ -1,13 +1,9 @@
-import collections
 import io
-import msvcrt
 import os
 import queue
-import re
 import requests
 import sounddevice
 import soundfile
-import speech_recognition
 import threading
 import time
 from datetime import datetime
@@ -15,7 +11,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -24,30 +19,50 @@ load_dotenv()
 CHROME_DRIVER_PATH = "C:\\Program Files\\chromedriver-win64\\chromedriver.exe"
 MICROPHONE_NAME = "Microphone Array"
 VIRTUAL_MICROPHONE_NAME = "CABLE Output"
-VIRTUAL_SPEAKER_NAME = "CABLE Input"
+VIRTUAL_SPEAKER_NAME = "CABLE Input (VB-Audio Virtual Cable)"
 VIRTUAL_SPEAKER_INDEX = 12  # Find via `print(sounddevice.query_devices())`
 CHUNK_SIZE = 1024
 EL_API_KEY = os.getenv("EL_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LOGS_PATH = ".\\logs.txt"
-USERNAME = "Logan"
+USERNAME = "Logan Davidson"
 CONTEXT = """Logan is a software engineer that works at a company called AutoRek.
 This conversation is an ongoing Microsoft Teams work call."""
 
 
-class AudioChunk:
-    def __init__(self, id, audio, timestamp):
-        self.id = id
-        self.audio = audio
+class TranscriptItem:
+    def __init__(self, timestamp, speaker, content):
         self.timestamp = timestamp
+        self.speaker = speaker
+        self.content = content
 
 
-class TranscriptionChunk:
-    def __init__(self, text, timestamp, type):
-        self.text = text
-        self.timestamp = timestamp
-        self.type = type
+class TranscriptManager:
+    def __init__(self):
+        self.transcript = {}
+        self.lock = threading.Lock()
+
+    def write_item(self, id, timestamp, speaker, content):
+        """
+        Create a new transcript item or update content of an existing one.
+        """
+        with self.lock:
+            if id not in self.transcript.keys():
+                new_item = TranscriptItem(timestamp, speaker, content)
+                self.transcript[id] = new_item
+                return "Created"
+            elif self.transcript[id].content != content:
+                existing_item = self.transcript[id]
+                existing_item.content = content
+                return "Updated"
+
+    def read_items(self):
+        """
+        Return a list of all transcript items.
+        """
+        with self.lock:
+            return list(self.transcript.values())
 
 
 def click_button(xpath):
@@ -60,9 +75,6 @@ def click_button(xpath):
 
 
 def set_audio_device(chrome_driver, audio_device_name):
-    if chrome_driver is None:
-        return
-
     device_locator = f"//*[contains(text(), '{audio_device_name}')]"
     setting_locator = f"//*[contains(text(), 'Audio settings')]"
     more_locator = "//button[@id='callingButtons-showMoreBtn']"
@@ -140,80 +152,66 @@ def speak(text_to_speak, chrome_driver):
     set_audio_device(chrome_driver, MICROPHONE_NAME)
 
 
-def recorder(audio_queue, message_queue):
-    with speech_recognition.Microphone() as source:
-        recognizer = speech_recognition.Recognizer()
-        recognizer.pause_threshold = 0.5
-
-        id = 0
-        while True:
-            try:
-                message_queue.put(f".. Started recording chunk {id}")
-                audio = recognizer.listen(
-                    source, timeout=5, phrase_time_limit=30)
-                message_queue.put(
-                    f".. Finished recording chunk {id}: success")
-                audio_chunk = AudioChunk(id, audio, datetime.now())
-                audio_queue.put(audio_chunk)
-            except speech_recognition.WaitTimeoutError:
-                message_queue.put(
-                    f".. Finished recording chunk {id}: error")
-
-            id += 1
-
-
 def logger(message_queue):
     while True:
         message = message_queue.get()
         if message is None:
             break
-        time_now = time.strftime(r"%Y-%m-%d %H:%M:%S", time.localtime())
+        time_now = time.strftime(r"%Y-%m-%d %H:%M:%S:", time.localtime())
         with open(LOGS_PATH, "a") as file:
             file.write(f"{time_now} {message}\n")
 
 
-def transcriber(audio_queue, transcription_queue, message_queue):
-    recognizer = speech_recognition.Recognizer()
+def transcriber(chrome_driver, transcript_manager, message_queue):
+    captions_wrapper_locator = f"//div[@data-tid='closed-caption-v2-wrapper']"
+    caption_locator = f"//div[@data-tid='closed-caption-message-content']"
+    caption_header_locator = f".//div[contains(@class, 'ui-chat__messageheader')]"
+    caption_content_locator = f".//div[contains(@class, 'ui-chat__messagecontent')]"
 
     while True:
-        audio_chunk: AudioChunk = audio_queue.get()
-        if audio_chunk is None:
-            time.sleep(0.1)
-            continue
-
-        message_queue.put(f".... Started transcribing chunk {audio_chunk.id}")
-
-        message_prefix = f"Finished transcribing chunk {audio_chunk.id}:"
-        recognized_speech = ""
         try:
-            recognized_speech = recognizer.recognize_google(audio_chunk.audio)
-            transcription_chunk = TranscriptionChunk(
-                recognized_speech, audio_chunk.timestamp, "others")
-            transcription_queue.put(transcription_chunk)
-            message_queue.put(f'.... {message_prefix} "{recognized_speech}"')
-        except speech_recognition.UnknownValueError:
-            message_queue.put(f".... {message_prefix} not understood")
-        except speech_recognition.RequestError as e:
-            message_queue.put(f".... {message_prefix} error")
+            captions = chrome_driver.find_element(
+                By.XPATH, captions_wrapper_locator).find_elements(By.XPATH, caption_locator)[-10:]
+            for caption in captions:
+                caption_id = caption.find_element(
+                    By.XPATH, "./div[1]").get_attribute("id")
+                caption_header = caption.find_element(
+                    By.XPATH, caption_header_locator).text
+                caption_content = caption.find_element(
+                    By.XPATH, caption_content_locator).text
+                timestamp = datetime.now()
+                result = transcript_manager.write_item(
+                    caption_id, timestamp, caption_header, caption_content)
+                if result:
+                    message_queue.put(f"{result} transcript item: {
+                                      caption_header}: {caption_content}")
+        except:
+            time.sleep(1)
 
 
-def generate_speech(openai_client, annotated_transcript, user_command_text):
+def generate_speech(
+    openai_client,
+    transcript_manager: TranscriptManager,
+    user_command_text
+):
+    # Get transcript
+    annotated_transcript = transcript_manager.read_items()
 
     # Build messages
     messages = []
-    if annotated_transcript:
+    if len(annotated_transcript) > 0:
         formatted_transcript = "\n".join(
-            [f"{chunk.timestamp} {chunk.type}: {chunk.text}" for chunk in annotated_transcript])
+            [f"{item.timestamp} {item.speaker}: {item.content}" for item in annotated_transcript])
         messages.append({
             "role": "user",
-            "content": f"""Here's a transcript of the conversation up until:\n{formatted_transcript}"""
+            "content": f"""Here's a live transcript of the conversation up until now:\n{formatted_transcript}"""
         })
     messages.append({"role": "user", "content": CONTEXT})
     messages.append({
         "role": "user",
-        "content": f"""You must take the role of {USERNAME}, a participant in the conversation.
+        "content": f"""You must take on the role of {USERNAME}, a participant in the conversation.
 Respond with only the words {USERNAME} would say, no more.
-Your response must not include any additional information like timestamps or usernames."""
+Your response must not be prefixed with any additional information like timestamps or your name."""
     })
     user_command_text = user_command_text.strip()
     hint = f" (hint: {user_command_text})" if user_command_text else ""
@@ -232,34 +230,23 @@ Your response must not include any additional information like timestamps or use
 def process_command(
     openai_client,
     chrome_driver,
-    transcription_queue,
-    annotated_transcript: List[TranscriptionChunk]
+    transcript_manager: TranscriptManager
 ):
     user_command = input(">>> ")
-
-    # Move items from transcription queue to main queue
-    while not transcription_queue.empty():
-        annotated_transcript.append(transcription_queue.get())
 
     # If command starts with "s/", speak the rest of the command
     if user_command.startswith("s/"):
         text_to_speak = user_command[2:]
-        transcription_chunk = TranscriptionChunk(
-            text_to_speak, datetime.now(), "Logan")
-        annotated_transcript.append(transcription_chunk)
         speak(text_to_speak, chrome_driver)
         return
 
-    # If command starts with "g/", generate some text based on the command and speak it
-    if user_command.startswith("g/"):
-        user_command_text = user_command[2:]
-        text_to_speak = generate_speech(
-            openai_client, annotated_transcript, user_command_text)
-        transcription_chunk = TranscriptionChunk(
-            text_to_speak, datetime.now(), "Logan")
-        annotated_transcript.append(transcription_chunk)
-        speak(text_to_speak, chrome_driver)
-        return
+    # Otherwise", generate some text based on the command and speak it
+
+    user_command_text = user_command[2:]
+    text_to_speak = generate_speech(
+        openai_client, transcript_manager, user_command_text)
+    speak(text_to_speak, chrome_driver)
+    return
 
 
 # Connect to browser
@@ -267,13 +254,9 @@ chrome_options = webdriver.ChromeOptions()
 chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
 chrome_driver = webdriver.Chrome(options=chrome_options)
 
-# Create queues
-audio_queue = queue.Queue()
+# Create message queue and transcript manager
 message_queue = queue.Queue()
-transcription_queue = queue.Queue()
-
-# Create annotated transcript
-annotated_transcript = []
+transcript_manager = TranscriptManager()
 
 # Create a file lock
 file_lock = threading.Lock()
@@ -291,15 +274,11 @@ logger_thread = threading.Thread(
     target=logger, args=(message_queue,))
 logger_thread.start()
 
-recorder_thread = threading.Thread(
-    target=recorder, args=(audio_queue, message_queue))
-recorder_thread.start()
-
 transcriber_thread = threading.Thread(
-    target=transcriber, args=(audio_queue, transcription_queue, message_queue))
+    target=transcriber, args=(chrome_driver, transcript_manager, message_queue))
 transcriber_thread.start()
 
 # Main loop
 while True:
     process_command(
-        openai_client, chrome_driver, transcription_queue, annotated_transcript)
+        openai_client, chrome_driver, transcript_manager)
