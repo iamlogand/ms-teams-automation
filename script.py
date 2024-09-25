@@ -1,3 +1,4 @@
+import concurrent.futures
 import io
 import os
 import queue
@@ -20,8 +21,8 @@ CHROME_DRIVER_PATH = "C:\\Program Files\\chromedriver-win64\\chromedriver.exe"
 MICROPHONE_NAME = "Microphone Array"
 VIRTUAL_MICROPHONE_NAME = "CABLE Output"
 VIRTUAL_SPEAKER_NAME = "CABLE Input (VB-Audio Virtual Cable)"
-VIRTUAL_SPEAKER_INDEX = 12  # Find via `print(sounddevice.query_devices())`
-CHUNK_SIZE = 1024
+AUDIO_CHUNK_SIZE = 1024
+EL_MAX_CONCURRENT_REQUESTS = 5
 EL_API_KEY = os.getenv("EL_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -59,10 +60,12 @@ class TranscriptManager:
 
     def read_items(self):
         """
-        Return a list of all transcript items.
+        Return a list of all transcript items ordered from oldest to newest.
         """
         with self.lock:
-            return list(self.transcript.values())
+            items = list(self.transcript.values())
+            items.sort(key=lambda x: x.timestamp)
+            return items
 
 
 def click_button(xpath):
@@ -92,6 +95,27 @@ def set_audio_device(chrome_driver, audio_device_name):
     button.click()
 
 
+def split_text(text):
+    '''
+    Take a string of text and split it into a list of sentences.
+    '''
+    terminators = [".", "!", "?"]
+    sentences = []
+    current_sentence = ""
+    for index, char in enumerate(text):
+        current_sentence += char
+        if char in terminators or index == len(text) - 1:
+            sentences.append(current_sentence)
+            current_sentence = ""
+    adjusted_sentences = []
+    for index, sentence in enumerate(sentences):
+        if sentence in terminators and len(adjusted_sentences) > 0:
+            adjusted_sentences[-1] += sentence
+        else:
+            adjusted_sentences.append(sentence.strip())
+    return adjusted_sentences
+
+
 def fetch_audio(text_to_speak):
     tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
     headers = {
@@ -111,7 +135,7 @@ def fetch_audio(text_to_speak):
     response = requests.post(tts_url, headers=headers, json=data, stream=True)
     if response.ok:
         audio_data = bytearray()
-        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+        for chunk in response.iter_content(chunk_size=AUDIO_CHUNK_SIZE):
             audio_data.extend(chunk)
         return audio_data
     else:
@@ -134,19 +158,68 @@ def play_audio(audio_data):
         sounddevice.wait()
 
 
-def speak(text_to_speak, chrome_driver):
+def fetch_audio_with_semaphore(semaphore, sentence):
+    with semaphore:  # Acquire the semaphore before making the API call
+        return fetch_audio(sentence)
+
+
+def audio_playback_worker(audio_data_list, audio_ready_events):
+    for index in range(len(audio_data_list)):
+        # Wait until the audio for this sentence is ready
+        audio_ready_events[index].wait()
+        audio_data = audio_data_list[index]
+        if audio_data is not None:  # Ensure audio data is not None before playing
+            play_audio(audio_data)
+
+
+def speak(chrome_driver, semaphore, text_to_speak):
     # Switch to virtual microphone
     set_audio_device(chrome_driver, VIRTUAL_MICROPHONE_NAME)
 
-    # Fetch audio
-    print("Speaking:", text_to_speak)
-    audio_data = fetch_audio(text_to_speak)
+    # Split by sentence
+    sentences = split_text(text_to_speak)
 
-    if audio_data is not None:
-        play_audio(audio_data)
-        print("Done speaking")
-    else:
-        print("Failed to fetch audio.")
+    # Print what we are going to speak
+    print("Speaking:", text_to_speak)
+
+    # Prepare a list to store audio data in the order of sentences
+    audio_data_list = [None] * len(sentences)
+
+    # Create a threading event for each audio
+    audio_ready_events = [threading.Event() for _ in range(len(sentences))]
+
+    # Start the audio playback thread
+    playback_thread = threading.Thread(
+        target=audio_playback_worker, args=(audio_data_list, audio_ready_events))
+    playback_thread.start()
+
+    # Use ThreadPoolExecutor to fetch audio concurrently
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Submit tasks to fetch audio for each sentence with its index
+        future_to_index = {
+            executor.submit(fetch_audio_with_semaphore, semaphore, sentence): index
+            for index, sentence in enumerate(sentences)
+        }
+
+        # Process futures as they complete
+        for future in concurrent.futures.as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                audio_data = future.result()
+                if audio_data is not None:
+                    # Store audio data at the correct index
+                    audio_data_list[index] = audio_data
+                    # Signal that audio is ready
+                    audio_ready_events[index].set()
+                else:
+                    print(f"Failed to fetch audio for: {sentences[index]}")
+            except Exception as e:
+                print(f"Error fetching audio for {sentences[index]}: {e}")
+
+    # Wait for the playback thread to finish
+    playback_thread.join()
+
+    print("Done speaking")
 
     # Switch to microphone
     set_audio_device(chrome_driver, MICROPHONE_NAME)
@@ -183,8 +256,8 @@ def transcriber(chrome_driver, transcript_manager, message_queue):
                 result = transcript_manager.write_item(
                     caption_id, timestamp, caption_header, caption_content)
                 if result:
-                    message_queue.put(f"{result} transcript item: {
-                                      caption_header}: {caption_content}")
+                    message_queue.put(
+                        f"{result} transcript item: {caption_header}: {caption_content}")
         except:
             time.sleep(1)
 
@@ -230,22 +303,13 @@ Your response must not be prefixed with any additional information like timestam
 def process_command(
     openai_client,
     chrome_driver,
+    semaphore,
     transcript_manager: TranscriptManager
 ):
     user_command = input(">>> ")
-
-    # If command starts with "s/", speak the rest of the command
-    if user_command.startswith("s/"):
-        text_to_speak = user_command[2:]
-        speak(text_to_speak, chrome_driver)
-        return
-
-    # Otherwise", generate some text based on the command and speak it
-
-    user_command_text = user_command[2:]
     text_to_speak = generate_speech(
-        openai_client, transcript_manager, user_command_text)
-    speak(text_to_speak, chrome_driver)
+        openai_client, transcript_manager, user_command)
+    speak(chrome_driver, semaphore, text_to_speak)
     return
 
 
@@ -278,7 +342,10 @@ transcriber_thread = threading.Thread(
     target=transcriber, args=(chrome_driver, transcript_manager, message_queue))
 transcriber_thread.start()
 
+# Create semaphore for limiting concurrent requests
+semaphore = threading.Semaphore(EL_MAX_CONCURRENT_REQUESTS)
+
 # Main loop
 while True:
     process_command(
-        openai_client, chrome_driver, transcript_manager)
+        openai_client, chrome_driver, semaphore, transcript_manager)
