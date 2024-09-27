@@ -21,5 +21,9 @@ Setup:
    "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
    ```
 1. In that Chrome tab, go to https://teams.microsoft.com/v2/ and join a call
-1. Show live captions
+1. Ensure that live captions are on
 1. Start the python script
+
+Usage:
+1. Once you see ">>>", press enter to make the script respond to the conversation.
+1. Optionally, before pressing enter, type some text to give the script an indication of what to say.
