@@ -1,15 +1,15 @@
-import concurrent.futures
-import io
+import asyncio
+import base64
+import json
 import os
 import queue
-import requests
-import sounddevice
-import soundfile
+import subprocess
 import threading
 import time
+import websockets
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
@@ -29,6 +29,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LOGS_PATH = ".\\logs.txt"
 USERNAME = "Logan Davidson"
 CONTEXT = """Logan is a software engineer that works at a company called AutoRek.
+Logan is British and in his 20s, like most people in the team.
+At AutoRek, things are usually informal, with none of the standard business talk.
+Logan sometimes uses filler words, especially between sentences when thinking about what to say.
 This conversation is an ongoing Microsoft Teams work call."""
 
 
@@ -95,136 +98,6 @@ def set_audio_device(chrome_driver, audio_device_name):
     button.click()
 
 
-def split_text(text):
-    '''
-    Take a string of text and split it into a list of sentences.
-    '''
-    terminators = [".", "!", "?"]
-    sentences = []
-    current_sentence = ""
-    for index, char in enumerate(text):
-        current_sentence += char
-        if char in terminators or index == len(text) - 1:
-            sentences.append(current_sentence)
-            current_sentence = ""
-    adjusted_sentences = []
-    for index, sentence in enumerate(sentences):
-        if sentence in terminators and len(adjusted_sentences) > 0:
-            adjusted_sentences[-1] += sentence
-        else:
-            adjusted_sentences.append(sentence.strip())
-    return adjusted_sentences
-
-
-def fetch_audio(text_to_speak):
-    tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream"
-    headers = {
-        "Accept": "application/json",
-        "xi-api-key": EL_API_KEY
-    }
-    data = {
-        "text": text_to_speak,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.8,
-            "style": 0.0,
-            "use_speaker_boost": True
-        }
-    }
-    response = requests.post(tts_url, headers=headers, json=data, stream=True)
-    if response.ok:
-        audio_data = bytearray()
-        for chunk in response.iter_content(chunk_size=AUDIO_CHUNK_SIZE):
-            audio_data.extend(chunk)
-        return audio_data
-    else:
-        print(response.text)
-        return None
-
-
-def play_audio(audio_data):
-    # Find output device
-    devices = sounddevice.query_devices()
-    for index, device in enumerate(devices):
-        if device['name'] == VIRTUAL_SPEAKER_NAME:
-            virtual_speaker_index = index
-            break
-
-    # Play audio
-    with io.BytesIO(audio_data) as audio_stream:
-        data, samplerate = soundfile.read(audio_stream)
-        sounddevice.play(data, samplerate, device=virtual_speaker_index)
-        sounddevice.wait()
-
-
-def fetch_audio_with_semaphore(semaphore, sentence):
-    with semaphore:  # Acquire the semaphore before making the API call
-        return fetch_audio(sentence)
-
-
-def audio_playback_worker(audio_data_list, audio_ready_events):
-    for index in range(len(audio_data_list)):
-        # Wait until the audio for this sentence is ready
-        audio_ready_events[index].wait()
-        audio_data = audio_data_list[index]
-        if audio_data is not None:  # Ensure audio data is not None before playing
-            play_audio(audio_data)
-
-
-def speak(chrome_driver, semaphore, text_to_speak):
-    # Switch to virtual microphone
-    set_audio_device(chrome_driver, VIRTUAL_MICROPHONE_NAME)
-
-    # Split by sentence
-    sentences = split_text(text_to_speak)
-
-    # Print what we are going to speak
-    print("Speaking:", text_to_speak)
-
-    # Prepare a list to store audio data in the order of sentences
-    audio_data_list = [None] * len(sentences)
-
-    # Create a threading event for each audio
-    audio_ready_events = [threading.Event() for _ in range(len(sentences))]
-
-    # Start the audio playback thread
-    playback_thread = threading.Thread(
-        target=audio_playback_worker, args=(audio_data_list, audio_ready_events))
-    playback_thread.start()
-
-    # Use ThreadPoolExecutor to fetch audio concurrently
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        # Submit tasks to fetch audio for each sentence with its index
-        future_to_index = {
-            executor.submit(fetch_audio_with_semaphore, semaphore, sentence): index
-            for index, sentence in enumerate(sentences)
-        }
-
-        # Process futures as they complete
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
-            try:
-                audio_data = future.result()
-                if audio_data is not None:
-                    # Store audio data at the correct index
-                    audio_data_list[index] = audio_data
-                    # Signal that audio is ready
-                    audio_ready_events[index].set()
-                else:
-                    print(f"Failed to fetch audio for: {sentences[index]}")
-            except Exception as e:
-                print(f"Error fetching audio for {sentences[index]}: {e}")
-
-    # Wait for the playback thread to finish
-    playback_thread.join()
-
-    print("Done speaking")
-
-    # Switch to microphone
-    set_audio_device(chrome_driver, MICROPHONE_NAME)
-
-
 def logger(message_queue):
     while True:
         message = message_queue.get()
@@ -262,13 +135,93 @@ def transcriber(chrome_driver, transcript_manager, message_queue):
             time.sleep(1)
 
 
-def generate_speech(
-    openai_client,
-    transcript_manager: TranscriptManager,
-    user_command_text
-):
+async def text_chunker(chunks):
+    """
+    Split text into chunks, ensuring to not break sentences.
+    """
+    splitters = (
+        ".", ",", "?", "!", ";", ":", "—", "-", "(", ")", "[", "]", "}", " ")
+    buffer = ""
+
+    async for text in chunks:
+        if text is None or text == "":
+            continue  # Skip None or empty values
+
+        if buffer.endswith(splitters):
+            yield buffer + " "
+            buffer = text
+        elif text.startswith(splitters):
+            yield buffer + text[0] + " "
+            buffer = text[1:]
+        else:
+            buffer += text
+
+    if buffer:
+        yield buffer + " "
+
+
+async def stream(audio_stream):
+    """
+    Stream audio data using mpv player.
+    """
+    mpv_process = subprocess.Popen(
+        ["C:\\Program Files (x86)\\mpv\\mpv.exe", "--no-cache", "--no-terminal", "--", "fd://0"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    async for chunk in audio_stream:
+        if chunk:
+            mpv_process.stdin.write(chunk)
+            mpv_process.stdin.flush()
+
+    if mpv_process.stdin:
+        mpv_process.stdin.close()
+    mpv_process.wait()
+
+
+async def text_to_speech_input_streaming(text_iterator):
+    """
+    Send text to ElevenLabs API and stream the returned audio.
+    """
+    uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{
+        VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5"
+
+    async with websockets.connect(uri) as websocket:
+        await websocket.send(json.dumps({
+            "text": " ",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+            "xi_api_key": EL_API_KEY,
+        }))
+
+        async def listen():
+            """Listen to the websocket for audio data and stream it."""
+            while True:
+                try:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    if data.get("audio"):
+                        yield base64.b64decode(data["audio"])
+                    elif data.get('isFinal'):
+                        break
+                except websockets.exceptions.ConnectionClosed:
+                    print("Connection closed")
+                    break
+
+        listen_task = asyncio.create_task(stream(listen()))
+
+        async for text in text_chunker(text_iterator):
+            await websocket.send(json.dumps({"text": text}))
+
+        await websocket.send(json.dumps({"text": ""}))
+
+        await listen_task
+
+
+async def speak(openai_client, chrome_driver, transcript_manager, user_command):
+    """Retrieve text from OpenAI and pass it to the text-to-speech function."""
+
     # Get transcript
-    annotated_transcript = transcript_manager.read_items()
+    annotated_transcript = transcript_manager.read_items()[-10:]
 
     # Build messages
     messages = []
@@ -286,66 +239,70 @@ def generate_speech(
 Respond with only the words {USERNAME} would say, no more.
 Your response must not be prefixed with any additional information like timestamps or your name."""
     })
-    user_command_text = user_command_text.strip()
-    hint = f" (hint: {user_command_text})" if user_command_text else ""
+    user_command = user_command.strip()
+    hint = f" (hint: {user_command})" if user_command else ""
     messages.append({
         "role": "user",
         "content": f"What does {USERNAME} say next? {hint}"
     })
 
     # Generate completion
-    completion = openai_client.chat.completions.create(
-        model="gpt-4o-mini", messages=messages
-    )
-    return completion.choices[0].message.content
+    response = await openai_client.chat.completions.create(model='gpt-4o-mini', messages=messages, stream=True)
+
+    async def text_iterator():
+        async for chunk in response:
+            delta = chunk.choices[0].delta
+            token = delta.content
+            if token:
+                print(token, end='', flush=True)
+            yield token
+
+    set_audio_device(chrome_driver, VIRTUAL_MICROPHONE_NAME)
+    await text_to_speech_input_streaming(text_iterator())
+    print()
+    set_audio_device(chrome_driver, MICROPHONE_NAME)
 
 
-def process_command(
-    openai_client,
-    chrome_driver,
-    semaphore,
-    transcript_manager: TranscriptManager
-):
-    user_command = input(">>> ")
-    text_to_speak = generate_speech(
-        openai_client, transcript_manager, user_command)
-    speak(chrome_driver, semaphore, text_to_speak)
-    return
+async def process_command(openai_client, chrome_driver, transcript_manager):
+    while True:
+        user_command = input(">>> ")
+        await speak(openai_client, chrome_driver, transcript_manager, user_command)
 
 
-# Connect to browser
-chrome_options = webdriver.ChromeOptions()
-chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-chrome_driver = webdriver.Chrome(options=chrome_options)
+async def main(openai_client, chrome_driver, transcript_manager):
+    # Start the command processing loop
+    await process_command(openai_client, chrome_driver, transcript_manager)
 
-# Create message queue and transcript manager
-message_queue = queue.Queue()
-transcript_manager = TranscriptManager()
+if __name__ == "__main__":
+    # Connect to browser
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    chrome_driver = webdriver.Chrome(options=chrome_options)
 
-# Create a file lock
-file_lock = threading.Lock()
+    # Create message queue and transcript manager
+    message_queue = queue.Queue()
+    transcript_manager = TranscriptManager()
 
-# Create empty logs file
-with open(LOGS_PATH, "w") as file:
-    pass
+    # Create a file lock
+    file_lock = threading.Lock()
 
-# Create OpenAI client
-openai_client = OpenAI()
-openai_client.api_key = os.getenv("OPENAI_API_KEY")
+    # Create empty logs file
+    with open(LOGS_PATH, "w") as file:
+        pass
 
-# Create and start threads for recording, recognition, logging, and transcription processing
-logger_thread = threading.Thread(
-    target=logger, args=(message_queue,))
-logger_thread.start()
+    # Create OpenAI client
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-transcriber_thread = threading.Thread(
-    target=transcriber, args=(chrome_driver, transcript_manager, message_queue))
-transcriber_thread.start()
+    # Create and start threads for recording, recognition, logging, and transcription processing
+    logger_thread = threading.Thread(target=logger, args=(message_queue,))
+    logger_thread.start()
 
-# Create semaphore for limiting concurrent requests
-semaphore = threading.Semaphore(EL_MAX_CONCURRENT_REQUESTS)
+    transcriber_thread = threading.Thread(target=transcriber, args=(
+        chrome_driver, transcript_manager, message_queue))
+    transcriber_thread.start()
 
-# Main loop
-while True:
-    process_command(
-        openai_client, chrome_driver, semaphore, transcript_manager)
+    # Create semaphore for limiting concurrent requests
+    semaphore = threading.Semaphore(EL_MAX_CONCURRENT_REQUESTS)
+
+    # Start the main asyncio loop
+    asyncio.run(main(openai_client, chrome_driver, transcript_manager))

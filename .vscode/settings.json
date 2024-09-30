@@ -1,19 +1,25 @@
 {
     "cSpell.words": [
+        "aclient",
+        "aiohttp",
         "astype",
         "chromedriver",
+        "chunker",
         "dotenv",
         "dtype",
+        "elevenlabs",
         "frombuffer",
         "indata",
         "messagecontent",
         "messageheader",
         "openai",
+        "outdata",
         "pynput",
         "samplerate",
         "sounddevice",
         "soundfile",
         "tobytes",
-        "UNLCK"
+        "UNLCK",
+        "websockets"
     ]
 }

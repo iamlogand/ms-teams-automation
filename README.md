@@ -8,6 +8,7 @@ Required software:
 - Chrome Driver
 - VLC Media Player
 - VB-Cable
+- MPV
 
 Setup:
 1. Create a Python virtual environment and install packages from requirements.txt
