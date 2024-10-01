@@ -20,7 +20,7 @@ load_dotenv()
 CHROME_DRIVER_PATH = "C:\\Program Files\\chromedriver-win64\\chromedriver.exe"
 MICROPHONE_NAME = "Microphone Array"
 VIRTUAL_MICROPHONE_NAME = "CABLE Output"
-VIRTUAL_SPEAKER_NAME = "CABLE Input (VB-Audio Virtual Cable)"
+VIRTUAL_SPEAKER_NAME = "{afeab4bf-ab5d-4d43-bd5c-a81b237a6670}"
 AUDIO_CHUNK_SIZE = 1024
 EL_MAX_CONCURRENT_REQUESTS = 5
 EL_API_KEY = os.getenv("EL_API_KEY")
@@ -165,7 +165,14 @@ async def stream(audio_stream):
     Stream audio data using mpv player.
     """
     mpv_process = subprocess.Popen(
-        ["C:\\Program Files (x86)\\mpv\\mpv.exe", "--no-cache", "--no-terminal", "--", "fd://0"],
+        [
+            "C:\\Program Files (x86)\\mpv\\mpv.exe",
+            "--no-cache",
+            "--no-terminal",
+            f"--audio-device=wasapi/{VIRTUAL_SPEAKER_NAME}", # when i add this line, it doesn't work
+            "--",
+            "fd://0"
+        ],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 

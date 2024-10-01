@@ -20,6 +20,7 @@
         "soundfile",
         "tobytes",
         "UNLCK",
+        "wasapi",
         "websockets"
     ]
 }
