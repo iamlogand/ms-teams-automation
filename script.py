@@ -117,7 +117,7 @@ def transcriber(chrome_driver, transcript_manager, message_queue):
     while True:
         try:
             captions = chrome_driver.find_element(
-                By.XPATH, captions_wrapper_locator).find_elements(By.XPATH, caption_locator)[-10:]
+                By.XPATH, captions_wrapper_locator).find_elements(By.XPATH, caption_locator)[-100:]
             for caption in captions:
                 caption_id = caption.find_element(
                     By.XPATH, "./div[1]").get_attribute("id")

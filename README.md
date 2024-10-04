@@ -2,6 +2,10 @@
 
 A Python script for Windows that can play sounds in MS Teams through a virtual audio cable.
 
+Required API subscriptions:
+- OpenAI
+- ElevenLabs (professional voice clone is recommended)
+
 Required software:
 - Python
 - Chrome
